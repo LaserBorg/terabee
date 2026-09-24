@@ -1,52 +1,120 @@
 # Terabee 3dCam 8060
 
-The 3Dcam 8060 is a rebadged LIPSedge M3 LED camera module (based on TI OPT8320 sensor)
+A rebadged **LIPSedge M3** (LIPS Corp, TI OPT8320 ToF sensor), sold by Terabee as
+the 3Dcam 80x60 / 8060. It enumerates as a UVC camera and reports 160x60 YUYV,
+but the 19200-byte payload is 80x60 pixels of 4 bytes.
 
-https://www.lips-hci.com/lipsedge-m3-led
+## Payload
 
-SDK: 
-https://dev.lips-hci.com/introduction-to-lipsedge-sdk-1-x/lipsedge-sdk-1-x/
+Two little-endian uint16 words per pixel:
 
-v1.1.0 windows, v1.1.1 linux
+| word | bytes | meaning |
+|---|---|---|
+| `w0` | 0–1 | **not** a second depth channel — only reaches ~0..13 in practice |
+| `w1` | 2–3 | bits 0–11 depth phase, **bits 12–15 rolling frame counter** |
 
+Three things to know, all verified on real captures:
 
+1. **The top 4 bits of `w1` are a frame counter, not data.** One value for the
+   whole frame, cycling `0,1,2,3`. Left unmasked, one pixel reads
+   `5774, 9748, 13595, 1648, …` as the counter steps — 100% of pixels on a
+   counter=1 frame exceed 4095. Because higher counts mean *nearer*, the
+   overflow makes near surfaces read as "no reading" and flicker black.
+   **This was the "hand suddenly goes black" bug.** Mask with `& 0x0FFF`.
+2. **Higher raw counts mean nearer.** Inverted vs. most depth sensors.
+3. **`4094`+ means "no reading", not "very far".** Full-scale returns are
+   dropouts; exclude them, don't smooth over them.
 
-## Range Mode
+`w0` is not a second phase, so the depth phase **cannot be unwrapped** against
+it — an earlier attempt to remove a rollover that way was based on a false
+premise and has been dropped.
 
-range mode is not a UVC register write — it's a configuration + calibration switch:
+## Range modes
 
-lens_mode	Mode	Range	    Calibration set
-0	        Close	0.2 – 1.2 m	0211…
-1           Normal	1 – 4 m	    0203…
+`lens_mode` selects a working range. It is **not** a UVC control and not a
+sensor register write: the vendor driver re-selects calibration data and
+re-programs the depth engine, so only the LIPS OpenNI2 driver can change it.
 
-### Switching modes
+| `lens_mode` | mode | nominal range | calibration |
+|---|---|---|---|
+| 0 | close | 0.2 – 1.2 m | `0211…` |
+| 1 | normal | 1 – 4 m | `0203…` |
 
-Edit `lens_mode` in `ModuleConfig.json`, then restart the viewer. The driver picks
-it up on the next open (it re-initialises the depth camera on switch).
+> **Caveat — the mode switch works, but does not change the raw stream.**
+> Measured with the session held open (see below), same scene:
+>
+> | mode | mean | p05/p95 | centre |
+> |---|---|---|---|
+> | 0 close | 2756 | 2377..3112 | 2839 |
+> | 1 normal | 2755 | 2377..3112 | 2927 |
+>
+> A mean difference of **0.9 counts out of ~2750**, and the two rendered frames
+> are visually identical. So `lens_mode` selects the *driver's* calibration and
+> depth-engine configuration; the V4L2 payload is the raw phase and is
+> mode-independent. Only the driver's own depth output (real millimetres, real
+> range) would show the difference.
+>
+> This means the observed ~1.24 m black cutoff is **not** explained by the mode
+> switch, and not by the frame counter either (that caused the flicker, above).
+> It is still unexplained.
 
+### Switching
+
+```sh
+python3 terabee3dcam.py --list-modes            # current mode + config path
+python3 terabee3dcam.py --mode close --stats    # switch, hold open, measure
 ```
-lens_mode = 0   close range   0.2 – 1.2 m
-lens_mode = 1   normal range  1 – 4 m
+
+**The session must stay open while streaming.** The driver restores `lens_mode`
+from `ModuleConfig.json` as soon as the device is closed, so setting the mode and
+immediately closing the handle changes nothing — a fresh session reads the old
+value straight back. The program therefore holds the session open for the whole
+run and closes it at exit. (V4L2 capture coexists fine with an open OpenNI2
+session; verified.)
+
+For a persistent change, edit `lens_mode` in `ModuleConfig.json` (search order:
+`./ModuleConfig.json`, then `./OpenNI2/Drivers/ModuleConfig.json`, then the
+driver's installed directory).
+
+### Prerequisite: the vendor udev rule
+
+The driver reads calibration over a **raw USB handle**, not `/dev/videoN`. Without
+the rule that open fails with `EACCES` and the SDK reports
+`Failed to initialize camera`, while plain V4L2 capture carries on working
+(because `/dev/videoN` has a desktop ACL). Install the vendor rule before using
+any SDK feature:
+
+```sh
+sudo sh _downloads/udev/install-udev-rule.sh
 ```
 
-`ModuleConfig.json` search order — the driver tries a local copy first, then the
-installed path:
+## Usage
 
-* `./ModuleConfig.json` next to the running binary
-* `./OpenNI2/Drivers/ModuleConfig.json` (alongside `libLIPSedge-DL.so`)
-* `/usr/etc/TERABEE/lib/ModuleConfig.json` (installed path, needs root)
-
-Runtime switching (no restart) is also available via the OpenNI2 device property:
-
-```cpp
-device.setProperty<int>(LIPS_DEVICE_CONFIG_LENS_MODE /* 304 */, 1 /* normal */);
+```sh
+python3 terabee3dcam.py                # live viewer: q quit, c colour, r rotate, +/- range
+python3 terabee3dcam.py --stats        # one-line stream statistics
+python3 terabee3dcam.py --channels     # raw channel inspector (all four fields)
+python3 terabee3dcam.py --seconds 5    # run for 5 s
 ```
 
-A prebuilt Linux tool for this is `CameraLensModeTest` — see `_downloads/`.
+Status text is drawn in a dark header bar above the frame rather than over it, so
+it stays readable whatever the depth image contains. (Overlaying outlined text on
+the frame looked doubled at this resolution: the black outline was thicker than
+the white fill, so it showed through the letterforms.)
+
+`--seconds` counts streaming time, not startup: opening the device through the
+vendor SDK takes a few seconds, and the clock starts after the first frame.
+
+Files:
+
+* `terabee3dcam.py` — capture, decode, render, CLI, optional mode switch
+* `lens_mode.py` — `lens_mode` read/write over OpenNI2 (pure `ctypes`, no build)
+* `tests/test_decode.py` — decode tests, frame-counter mask above all
+* `_downloads/` — SDKs, manuals, CAD, udev rule (git-ignored, ~253 MB)
 
 ## Local downloads
 
-Everything below is already fetched into `_downloads/` (git-ignored, ~253 MB).
+Everything below is in `_downloads/` (git-ignored).
 
 ### SDKs
 
@@ -117,3 +185,10 @@ https://web.archive.org/web/20230202112349/https://terabee.b-cdn.net/wp-content/
 https://web.archive.org/web/20230202112349/https://terabee.b-cdn.net/wp-content/uploads/2021/02/Terabee-3Dcam-SDK-1.6.0.0-Windows.zip
 
 https://web.archive.org/web/20230202112349/https://terabee.b-cdn.net/wp-content/uploads/2021/05/Terabee-3Dcam-80x60-user-manual.pdf
+
+
+## Installation
+
+```bash
+sudo sh 3dcam/udev/install-udev-rule.sh
+```

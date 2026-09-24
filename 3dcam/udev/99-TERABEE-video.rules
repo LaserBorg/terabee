@@ -1,0 +1,3 @@
+# Terabee distance sensor udev rule
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="2df2", ATTRS{idProduct}=="0214", MODE:="0666", GROUP:="video", SYMLINK+="terabee-depth"
+
